@@ -102,5 +102,5 @@ async function resolveMessage(webhookType, order) {
     .replace(/\[Delivery Date\]/g, order.delivered_at ? new Date(order.delivered_at).toLocaleDateString('en-PK') : '');
 }
 
+router.resolveMessage = resolveMessage;
 module.exports = router;
-module.exports.resolveMessage = resolveMessage;
