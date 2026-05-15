@@ -32,7 +32,7 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const qc = useQueryClient();
 
-  const [selectedPreset, setSelectedPreset] = useState('Last 7 days');
+  const [selectedPreset, setSelectedPreset] = useState('All time');
   const [customFrom,     setCustomFrom]     = useState('');
   const [customTo,       setCustomTo]       = useState('');
   const [showPicker,     setShowPicker]     = useState(false);
@@ -40,7 +40,7 @@ export default function Dashboard() {
   const preset    = DATE_PRESETS.find(p => p.label === selectedPreset);
   const dateRange = customFrom && customTo
     ? { from: customFrom, to: customTo }
-    : getDateRange(preset?.days ?? 7);
+    : getDateRange(preset?.days ?? null);
 
   const { data: ordersData, isLoading } = useQuery({
     queryKey: ['orders-dashboard', dateRange.from, dateRange.to],
