@@ -24,9 +24,8 @@ router.get('/', async (req, res) => {
     if (search)  query = query.or(
       `customer_name.ilike.%${search}%,shopify_order_number.ilike.%${search}%,postex_cn.ilike.%${search}%`
     );
-    // Use shopify_created_at if available, fallback to created_at
-    if (date_from) query = query.gte('shopify_created_at', `${date_from}T00:00:00.000Z`);
-    if (date_to)   query = query.lte('shopify_created_at', `${date_to}T23:59:59.999Z`);
+    if (date_from) query = query.gte('created_at', `${date_from}T00:00:00.000Z`);
+    if (date_to)   query = query.lte('created_at', `${date_to}T23:59:59.999Z`);
 
     const { data, error, count } = await query;
     if (error) throw error;
