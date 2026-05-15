@@ -31,7 +31,6 @@ async function initClient() {
     sock = makeWASocket({
       auth:   state,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: true,
       browser: ['OrderFlow', 'Chrome', '1.0'],
     });
 
