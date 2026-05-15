@@ -1,53 +1,95 @@
 // backend/services/whatsappService.js
-// Safe WhatsApp service - won't crash if baileys fails
+let sock      = null;
+let qrCode    = null;
+let isReady   = false;
+let initError = null;
+let isIniting = false;
 
-let waClient = null;
-let qrCode   = null;
-let isReady  = false;
-let initErr  = null;
-
-// Try to load baileys - if it fails, WhatsApp just won't work
 async function initClient() {
+  if (isIniting) return;
+  isIniting = true;
+  console.log('[WA] Starting init...');
+
   try {
+    console.log('[WA] Loading baileys...');
     const baileys = require('@whiskeysockets/baileys');
-    const makeWASocket = baileys.default;
-    const { DisconnectReason, useMultiFileAuthState } = baileys;
-    const { Boom } = require('@hapi/boom');
-    const pino = require('pino');
-    const fs   = require('fs');
+    console.log('[WA] Baileys loaded, version:', baileys.version || 'unknown');
 
-    const AUTH_PATH = '/tmp/wa-auth';
-    if (!fs.existsSync(AUTH_PATH)) fs.mkdirSync(AUTH_PATH, { recursive: true });
+    const makeWASocket          = baileys.default;
+    const { DisconnectReason,
+            useMultiFileAuthState } = baileys;
+    const { Boom }  = require('@hapi/boom');
+    const pino      = require('pino');
+    const fs        = require('fs');
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
+    const AUTH = '/tmp/wa-auth';
+    if (!fs.existsSync(AUTH)) fs.mkdirSync(AUTH, { recursive: true });
+    console.log('[WA] Auth directory ready');
 
-    waClient = makeWASocket({
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH);
+    console.log('[WA] Auth state loaded');
+
+    sock = makeWASocket({
       auth:   state,
       logger: pino({ level: 'silent' }),
-      browser: ['OrderFlow', 'Chrome', '1.0'],
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
     });
 
-    waClient.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) { qrCode = qr; isReady = false; console.log('[WA] QR ready'); }
-      if (connection === 'open')  { isReady = true; qrCode = null; console.log('[WA] ✅ Connected!'); }
-      if (connection === 'close') {
-        isReady = false;
-        const code = lastDisconnect?.error?.output?.statusCode;
-        if (code !== DisconnectReason.loggedOut) setTimeout(initClient, 5000);
-        else { fs.rmSync(AUTH_PATH, { recursive:true, force:true }); qrCode=null; waClient=null; }
+    console.log('[WA] Socket created, waiting for connection.update...');
+
+    sock.ev.on('connection.update', (update) => {
+      console.log('[WA] connection.update:', JSON.stringify({ 
+        connection: update.connection, 
+        hasQr: !!update.qr,
+        hasError: !!update.lastDisconnect?.error 
+      }));
+
+      if (update.qr) {
+        qrCode    = update.qr;
+        isReady   = false;
+        isIniting = false;
+        console.log('[WA] ✅ QR Code generated!');
+      }
+
+      if (update.connection === 'open') {
+        isReady   = true;
+        isIniting = false;
+        qrCode    = null;
+        console.log('[WA] ✅ Connected and ready!');
+      }
+
+      if (update.connection === 'close') {
+        isReady   = false;
+        isIniting = false;
+        const code = update.lastDisconnect?.error?.output?.statusCode;
+        console.log('[WA] Connection closed, code:', code);
+        if (code !== DisconnectReason.loggedOut) {
+          console.log('[WA] Reconnecting in 5s...');
+          setTimeout(() => initClient(), 5000);
+        } else {
+          fs.rmSync(AUTH, { recursive: true, force: true });
+          sock   = null;
+          qrCode = null;
+        }
       }
     });
-    waClient.ev.on('creds.update', saveCreds);
-    console.log('[WA] Initializing...');
+
+    sock.ev.on('creds.update', saveCreds);
+
   } catch (err) {
-    initErr = err.message;
-    console.error('[WA] Could not start:', err.message);
+    isIniting = false;
+    initError = err.message;
+    console.error('[WA] ❌ Init error:', err.message);
+    console.error('[WA] Stack:', err.stack?.split('\n')[1]);
+    setTimeout(() => initClient(), 15000);
   }
 }
 
 function getStatus() {
-  return { isReady, hasQr: !!qrCode, qrCode, error: initErr };
+  return { isReady, hasQr: !!qrCode, qrCode, error: initError, isIniting };
 }
 
 function formatPhone(phone) {
@@ -59,29 +101,27 @@ function formatPhone(phone) {
 }
 
 async function sendMessage(phone, message) {
-  if (!isReady || !waClient) return { status: 'skipped', reason: 'not connected' };
+  if (!isReady || !sock) return { status: 'skipped', reason: 'not connected' };
   try {
     const jid = formatPhone(phone);
     if (!jid) return { status: 'skipped', reason: 'invalid phone' };
-    await waClient.sendMessage(jid, { text: message });
+    await sock.sendMessage(jid, { text: message });
     return { status: 'sent' };
   } catch (err) {
-    console.error('[WA] Send error:', err.message);
     return { status: 'failed', error: err.message };
   }
 }
 
 function buildMessage(event, order) {
-  const n = order.customer_name || 'Customer';
+  const n   = order.customer_name || 'Customer';
   const num = `#${order.shopify_order_number}`;
   const amt = `PKR ${Number(order.total_price||0).toLocaleString()}`;
-  const city = order.shipping_city || '';
-  const cn = order.postex_cn || '';
+  const cn  = order.postex_cn || '';
   const msgs = {
-    confirmed: `Hello ${n}! 👋\n\n✅ *Order Confirmed*\n\nOrder *${num}* received.\n🛍 ${order.order_detail||'Your items'}\n💰 ${amt}\n💳 ${order.payment_method||'COD'}\n📍 ${city}\n\nThank you! 🙏`,
-    booked:    `Hello ${n}! 📦\n\nOrder *${num}* booked with PostEx.\n\n🔖 Tracking: *${cn}*\n📍 ${city}\n\nTrack: https://postex.pk/tracking?cn=${cn} 🚚`,
-    shipped:   `Hello ${n}! 🚚\n\nOrder *${num}* is on the way!\n\n📦 PostEx: *${cn}*\nTrack: https://postex.pk/tracking?cn=${cn}\n\nKeep phone available 📞`,
-    delivered: `Hello ${n}! 🎉\n\nOrder *${num}* has been delivered!\n\nThank you for shopping! ⭐`,
+    confirmed: `Hello ${n}! 👋\n\n✅ *Order Confirmed*\n\nOrder *${num}* received.\n🛍 ${order.order_detail||'Your items'}\n💰 ${amt}\n💳 ${order.payment_method||'COD'}\n📍 ${order.shipping_city||''}\n\nThank you! 🙏`,
+    booked:    `Hello ${n}! 📦\n\nOrder *${num}* booked with PostEx.\n\n🔖 Tracking: *${cn}*\n\nTrack: https://postex.pk/tracking?cn=${cn} 🚚`,
+    shipped:   `Hello ${n}! 🚚\n\nOrder *${num}* is on the way!\n\n📦 PostEx: *${cn}*\nTrack: https://postex.pk/tracking?cn=${cn}`,
+    delivered: `Hello ${n}! 🎉\n\nOrder *${num}* delivered!\n\nThank you! ⭐`,
   };
   return msgs[event] || null;
 }
@@ -92,7 +132,6 @@ async function notifyCustomer(event, order) {
   if (!message) return null;
   try {
     const result = await sendMessage(order.customer_phone, message);
-    // Log to DB silently
     try {
       const supabase = require('../lib/supabase');
       await supabase.from('whatsapp_logs').insert({
@@ -102,12 +141,11 @@ async function notifyCustomer(event, order) {
     } catch (_) {}
     return result;
   } catch (err) {
-    console.error('[WA] notifyCustomer error:', err.message);
     return null;
   }
 }
 
-// Start safely - don't crash the app if baileys fails
-initClient().catch(e => console.error('[WA] Init failed:', e.message));
+// Start on load
+initClient().catch(e => console.error('[WA] Startup error:', e.message));
 
 module.exports = { sendMessage, notifyCustomer, getStatus, initClient };
