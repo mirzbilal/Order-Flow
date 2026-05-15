@@ -1,7 +1,7 @@
 {
   "name": "orderflow-backend",
   "version": "1.0.0",
-  "description": "OrderFlow API — Shopify + PostEx + Supabase + WhatsApp",
+  "description": "OrderFlow API",
   "main": "server.js",
   "scripts": {
     "build": "echo 'No build step required'",
@@ -9,22 +9,19 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.45.0",
-    "@whiskeysockets/baileys": "^6.7.9",
     "axios": "^1.7.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "express-async-errors": "^3.1.1",
     "node-cron": "^3.0.3",
-    "pino": "^9.5.0",
     "qrcode": "^1.5.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "20.x"
   }
 }
