@@ -1,32 +1,19 @@
 // backend/services/shopifyService.js
-// Shopify API — credentials loaded dynamically from Supabase settings table
-
 const axios    = require('axios');
 const supabase = require('../lib/supabase');
 
-// ─── Load credentials from DB ─────────────────────────────────
 async function getCredentials() {
-  // Try DB first (OAuth/token connection saved via UI)
   const { data } = await supabase
-    .from('settings')
-    .select('value')
-    .eq('key', 'shopify_connection')
-    .maybeSingle();
+    .from('settings').select('value').eq('key', 'shopify_connection').maybeSingle();
 
   if (data?.value) {
     const conn = JSON.parse(data.value);
     return { shop: conn.shop, accessToken: conn.accessToken };
   }
-
-  // Fallback to .env
   if (process.env.SHOPIFY_STORE_URL && process.env.SHOPIFY_ACCESS_TOKEN) {
-    return {
-      shop:        process.env.SHOPIFY_STORE_URL,
-      accessToken: process.env.SHOPIFY_ACCESS_TOKEN,
-    };
+    return { shop: process.env.SHOPIFY_STORE_URL, accessToken: process.env.SHOPIFY_ACCESS_TOKEN };
   }
-
-  throw new Error('Shopify not connected. Go to Settings → Shopify App to connect your store.');
+  throw new Error('Shopify not connected.');
 }
 
 function makeClient(shop, accessToken) {
@@ -37,14 +24,54 @@ function makeClient(shop, accessToken) {
   });
 }
 
-// ─── Fetch unfulfilled orders ─────────────────────────────────
-async function fetchUnfulfilledOrders(limit = 250) {
+// ─── Fetch unfulfilled orders — newest first ──────────────────
+async function fetchUnfulfilledOrders(limit = 50) {
   const { shop, accessToken } = await getCredentials();
   const client = makeClient(shop, accessToken);
   const { data } = await client.get('/orders.json', {
-    params: { status: 'open', fulfillment_status: 'unfulfilled', limit },
+    params: {
+      status:              'open',
+      fulfillment_status:  'unfulfilled',
+      limit,
+      order:               'created_at DESC',   // ← newest first
+    },
   });
   return data.orders || [];
+}
+
+// ─── Fetch ALL unfulfilled orders with pagination ─────────────
+async function fetchAllUnfulfilledOrders() {
+  const { shop, accessToken } = await getCredentials();
+  const client = makeClient(shop, accessToken);
+  let allOrders = [];
+  let pageInfo   = null;
+  let isFirst    = true;
+
+  while (true) {
+    const params = {
+      status:             'open',
+      fulfillment_status: 'unfulfilled',
+      limit:              250,
+      order:              'created_at DESC',
+    };
+    if (pageInfo) params.page_info = pageInfo;
+
+    const { data, headers } = await client.get('/orders.json', { params });
+    const orders = data.orders || [];
+    allOrders = [...allOrders, ...orders];
+
+    // Get next page from Link header
+    const linkHeader = headers['link'] || '';
+    const nextMatch  = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>;\s*rel="next"/);
+    if (nextMatch && orders.length === 250) {
+      pageInfo = nextMatch[1];
+      isFirst  = false;
+    } else {
+      break;
+    }
+  }
+
+  return allOrders;
 }
 
 // ─── Fulfill an order ─────────────────────────────────────────
@@ -74,10 +101,8 @@ async function fulfillOrder(shopifyOrderId, trackingNumber) {
 async function registerWebhooks(appUrl) {
   const { shop, accessToken } = await getCredentials();
   const client = makeClient(shop, accessToken);
-
   const topics = ['orders/create', 'orders/updated', 'orders/cancelled'];
   const results = [];
-
   for (const topic of topics) {
     try {
       const { data } = await client.post('/webhooks.json', {
@@ -91,43 +116,42 @@ async function registerWebhooks(appUrl) {
   return results;
 }
 
-// ─── Normalize Shopify order → our DB schema ──────────────────
+// ─── Normalize Shopify order → DB schema ─────────────────────
 function normalizeOrder(o) {
   const addr = o.shipping_address || o.billing_address || {};
-  let phone = addr.phone || o.phone || o.customer?.phone || '';
+  let phone  = addr.phone || o.phone || o.customer?.phone || '';
   phone = phone.replace(/\D/g, '');
   if (phone.startsWith('92') && phone.length === 12) phone = '0' + phone.slice(2);
 
   return {
     shopify_order_id:     String(o.id),
     shopify_order_number: String(o.order_number || o.name || o.id),
-    customer_name:    `${addr.first_name || o.customer?.first_name || ''} ${addr.last_name || o.customer?.last_name || ''}`.trim() || 'Customer',
-    customer_email:   o.customer?.email || o.email || '',
-    customer_phone:   phone,
-    shipping_address: [addr.address1, addr.address2].filter(Boolean).join(', '),
-    shipping_city:    addr.city || '',
-    shipping_province:addr.province || '',
-    shipping_country: addr.country || 'Pakistan',
-    shipping_zip:     addr.zip || '',
-    total_price:      parseFloat(o.total_price || 0),
-    currency:         o.currency || 'PKR',
-    payment_method:   o.payment_gateway === 'cash_on_delivery' || o.payment_gateway === 'cod' ? 'COD' : 'Prepaid',
-    line_items:       o.line_items || [],
-    order_detail:     (o.line_items || []).map(i => `${i.quantity}x ${i.title}`).join(', '),
-    channel:          'shopify',
-    status:           'pending',
-    shopify_fulfilled: o.fulfillment_status === 'fulfilled',
+    customer_name:        `${addr.first_name || o.customer?.first_name || ''} ${addr.last_name || o.customer?.last_name || ''}`.trim() || 'Customer',
+    customer_email:       o.customer?.email || o.email || '',
+    customer_phone:       phone,
+    shipping_address:     [addr.address1, addr.address2].filter(Boolean).join(', '),
+    shipping_city:        addr.city || '',
+    shipping_province:    addr.province || '',
+    shipping_country:     addr.country || 'Pakistan',
+    shipping_zip:         addr.zip || '',
+    total_price:          parseFloat(o.total_price || 0),
+    currency:             o.currency || 'PKR',
+    payment_method:       o.payment_gateway === 'cash_on_delivery' || o.payment_gateway === 'cod' ? 'COD' : 'Prepaid',
+    line_items:           o.line_items || [],
+    order_detail:         (o.line_items || []).map(i => `${i.quantity}x ${i.title}`).join(', '),
+    channel:              'shopify',
+    status:               'pending',
+    shopify_fulfilled:    o.fulfillment_status === 'fulfilled',
   };
 }
 
-// ─── Map PostEx status → internal status ─────────────────────
 function mapPostexStatus(s) {
   const u = (s || '').toUpperCase();
-  if (u.includes('DELIVER')) return 'delivered';
+  if (u.includes('DELIVER'))  return 'delivered';
   if (u.includes('TRANSIT') || u.includes('DISPATCH') || u.includes('SHIPPED')) return 'in_transit';
-  if (u.includes('CANCEL'))  return 'cancelled';
-  if (u.includes('RETURN'))  return 'returned';
+  if (u.includes('CANCEL'))   return 'cancelled';
+  if (u.includes('RETURN'))   return 'returned';
   return 'in_transit';
 }
 
-module.exports = { fetchUnfulfilledOrders, fulfillOrder, registerWebhooks, normalizeOrder, mapPostexStatus, getCredentials };
+module.exports = { fetchUnfulfilledOrders, fetchAllUnfulfilledOrders, fulfillOrder, registerWebhooks, normalizeOrder, mapPostexStatus, getCredentials };
