@@ -1,33 +1,47 @@
 const express  = require('express');
 const router   = express.Router();
 const crypto   = require('crypto');
+const axios    = require('axios');
 const supabase = require('../lib/supabase');
 const shopify  = require('../services/shopifyService');
 const whatsapp = require('../services/whatsappService');
 
+// ─── Helper: get Shopify client ───────────────────────────────
+async function getShopifyClient() {
+  const { data } = await supabase
+    .from('settings').select('value').eq('key', 'shopify_connection').maybeSingle();
+
+  let shop, accessToken;
+
+  if (data?.value) {
+    const conn = JSON.parse(data.value);
+    shop        = conn.shop;
+    accessToken = conn.accessToken;
+  } else if (process.env.SHOPIFY_STORE_URL && process.env.SHOPIFY_ACCESS_TOKEN) {
+    shop        = process.env.SHOPIFY_STORE_URL;
+    accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
+  } else {
+    throw new Error('Shopify not connected — go to Shopify App page and connect your store');
+  }
+
+  return axios.create({
+    baseURL: `https://${shop}/admin/api/2024-10`,
+    headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' },
+    timeout: 25000,
+  });
+}
+
 // ─── POST /api/shopify/sync ───────────────────────────────────
-// Call multiple times to sync all pages of orders
 router.post('/sync', async (req, res) => {
   try {
-    const { page = 1 } = req.body;
-    const limit = 250;
+    const client = await getShopifyClient();
 
-    // Fetch one page of orders newest first
-    const { shop, accessToken } = await shopify.getCredentials();
-    const axios = require('axios');
-    const client = axios.create({
-      baseURL: `https://${shop}/admin/api/2024-10`,
-      headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' },
-      timeout: 25000,
-    });
-
+    // Fetch newest 250 unfulfilled orders
     const { data } = await client.get('/orders.json', {
       params: {
         status:             'open',
         fulfillment_status: 'unfulfilled',
-        limit,
-        order:              'created_at DESC',
-        page,
+        limit:              250,
       },
     });
 
@@ -35,44 +49,39 @@ router.post('/sync', async (req, res) => {
     let created = 0, skipped = 0, errors = 0;
 
     if (shopifyOrders.length === 0) {
-      return res.json({ success: true, total: 0, created: 0, skipped: 0, errors: 0, hasMore: false });
+      return res.json({ success: true, total: 0, created: 0, skipped: 0, errors: 0 });
     }
 
-    // Get existing IDs
+    // Check existing
     const ids = shopifyOrders.map(o => String(o.id));
     const { data: existing } = await supabase
       .from('orders').select('shopify_order_id').in('shopify_order_id', ids);
     const existingIds = new Set((existing || []).map(o => o.shopify_order_id));
 
-    // Build rows to insert
+    // Build insert rows
     const toInsert = [];
     for (const so of shopifyOrders) {
       if (existingIds.has(String(so.id))) { skipped++; continue; }
       try { toInsert.push(shopify.normalizeOrder(so)); }
-      catch (e) { errors++; console.error('Normalize:', e.message); }
+      catch (e) { errors++; console.error('Normalize error:', e.message); }
     }
 
     // Bulk insert
     if (toInsert.length > 0) {
-      const { data: inserted, error } = await supabase.from('orders').insert(toInsert).select();
-      if (error) { console.error('Insert:', error.message); errors += toInsert.length; }
-      else {
+      const { data: inserted, error } = await supabase
+        .from('orders').insert(toInsert).select();
+      if (error) {
+        console.error('Insert error:', error.message);
+        errors += toInsert.length;
+      } else {
         created = inserted?.length || toInsert.length;
-        (inserted || []).forEach(order =>
-          whatsapp.notifyCustomer('confirmed', order).catch(e => console.error('[WA]', e.message))
+        (inserted || []).forEach(o =>
+          whatsapp.notifyCustomer('confirmed', o).catch(e => console.error('[WA]', e.message))
         );
       }
     }
 
-    res.json({
-      success: true,
-      page,
-      total:   shopifyOrders.length,
-      created,
-      skipped,
-      errors,
-      hasMore: shopifyOrders.length === limit, // if full page, there might be more
-    });
+    res.json({ success: true, total: shopifyOrders.length, created, skipped, errors });
   } catch (err) {
     console.error('Sync error:', err.message);
     res.status(500).json({ error: err.message });
@@ -81,10 +90,14 @@ router.post('/sync', async (req, res) => {
 
 // ─── GET /api/shopify/sync-status ────────────────────────────
 router.get('/sync-status', async (req, res) => {
-  const { data } = await supabase
-    .from('shopify_sync_log').select('*')
-    .order('synced_at', { ascending: false }).limit(5);
-  res.json({ logs: data || [] });
+  try {
+    const { data } = await supabase
+      .from('shopify_sync_log').select('*')
+      .order('synced_at', { ascending: false }).limit(5);
+    res.json({ logs: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── POST /api/shopify/register-webhooks ─────────────────────
@@ -109,21 +122,22 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       if (digest !== hmacHeader) return res.status(401).json({ error: 'Invalid HMAC' });
     }
     const topic = req.headers['x-shopify-topic'];
-    const data  = JSON.parse(req.body.toString());
+    const body  = JSON.parse(req.body.toString());
     res.status(200).json({ received: true });
     setImmediate(async () => {
       try {
         if (topic === 'orders/create') {
-          const { data: existing } = await supabase
-            .from('orders').select('id').eq('shopify_order_id', String(data.id)).maybeSingle();
-          if (!existing) {
-            const normalized = shopify.normalizeOrder(data);
-            const { data: newOrder } = await supabase.from('orders').insert(normalized).select().single();
+          const { data: ex } = await supabase
+            .from('orders').select('id').eq('shopify_order_id', String(body.id)).maybeSingle();
+          if (!ex) {
+            const norm = shopify.normalizeOrder(body);
+            const { data: newOrder } = await supabase.from('orders').insert(norm).select().single();
             if (newOrder) whatsapp.notifyCustomer('confirmed', newOrder).catch(console.error);
           }
         }
         if (topic === 'orders/cancelled') {
-          await supabase.from('orders').update({ status:'cancelled' }).eq('shopify_order_id', String(data.id));
+          await supabase.from('orders').update({ status:'cancelled' })
+            .eq('shopify_order_id', String(body.id));
         }
       } catch (e) { console.error('[Webhook]', e.message); }
     });
