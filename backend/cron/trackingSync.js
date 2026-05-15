@@ -1,105 +1,122 @@
 // backend/cron/trackingSync.js
-const cron      = require('node-cron');
-const supabase  = require('../lib/supabase');
-const postex    = require('../services/postexService');
-const whatsapp  = require('../services/whatsappService');
+const cron     = require('node-cron');
+const supabase = require('../lib/supabase');
+const postex   = require('../services/postexService');
 
 function startCronJobs() {
 
-  // ── Every hour: sync PostEx tracking + fire WhatsApp on delivery ──
+  // ── Every hour: sync PostEx tracking ─────────────────────────
   cron.schedule('0 * * * *', async () => {
     console.log('[CRON] Syncing PostEx tracking...');
     try {
       const { data: shipments } = await supabase
-        .from('shipments')
-        .select('postex_cn, order_id, status')
-        .in('status', ['booked', 'in_transit']);
+        .from('orders')
+        .select('id, postex_cn, status')
+        .in('status', ['booked', 'in_transit'])
+        .not('postex_cn', 'is', null);
 
       if (!shipments?.length) return console.log('[CRON] No active shipments');
 
-      const cns = shipments.map(s => s.postex_cn);
-
-      for (let i = 0; i < cns.length; i += 10) {
-        const batch = cns.slice(i, i + 10);
+      let updated = 0;
+      for (const shipment of shipments) {
         try {
-          const result      = await postex.trackMultiple(batch);
-          const trackingList = Array.isArray(result.dist) ? result.dist : [];
+          const result = await postex.trackShipment(shipment.postex_cn);
+          if (result?.dist?.length > 0) {
+            const latest       = result.dist[0];
+            const mappedStatus = postex.mapPostexStatus(latest?.orderStatus || '');
+            if (mappedStatus && mappedStatus !== shipment.status) {
+              await supabase.from('orders')
+                .update({ status: mappedStatus, postex_status: latest.orderStatus })
+                .eq('id', shipment.id);
 
-          for (const t of trackingList) {
-            const cn             = t.trackingNumber;
-            const internalStatus = postex.mapPostexStatus(t.orderStatus || '');
-            const shipment       = shipments.find(s => s.postex_cn === cn);
-
-            // Update order + shipment status
-            await supabase.from('orders')
-              .update({ postex_status: t.orderStatus, status: internalStatus })
-              .eq('postex_cn', cn);
-            await supabase.from('shipments')
-              .update({ status: internalStatus, tracking_history: t })
-              .eq('postex_cn', cn);
-
-            // 📱 If newly delivered → send WhatsApp
-            if (internalStatus === 'delivered' && shipment?.status !== 'delivered') {
-              const { data: order } = await supabase
-                .from('orders').select('*').eq('postex_cn', cn).single();
-              if (order) {
-                whatsapp.notifyCustomer('delivered', order).catch(e =>
-                  console.error('[CRON][WhatsApp] delivered failed:', e.message)
-                );
+              // WhatsApp notification for delivered
+              if (mappedStatus === 'delivered') {
+                try {
+                  const whatsapp = require('../services/whatsappService');
+                  const { data: order } = await supabase.from('orders').select('*').eq('id', shipment.id).single();
+                  if (order) whatsapp.notifyCustomer('delivered', order).catch(console.error);
+                } catch (e) { console.error('[CRON][WA]', e.message); }
               }
-            }
-
-            // 📱 If newly in_transit (shipped) → send WhatsApp
-            if (internalStatus === 'in_transit' && shipment?.status === 'booked') {
-              const { data: order } = await supabase
-                .from('orders').select('*').eq('postex_cn', cn).single();
-              if (order) {
-                whatsapp.notifyCustomer('shipped', order).catch(e =>
-                  console.error('[CRON][WhatsApp] shipped failed:', e.message)
-                );
-              }
+              updated++;
             }
           }
         } catch (e) {
-          console.error('[CRON] Batch error:', e.message);
+          console.error(`[CRON] Track failed for ${shipment.postex_cn}:`, e.message);
         }
       }
-      console.log(`[CRON] Synced ${cns.length} shipments`);
+      console.log(`[CRON] PostEx tracking: updated ${updated} shipments`);
     } catch (e) {
       console.error('[CRON] Tracking sync failed:', e.message);
     }
   });
 
-  // ── Every 6 hours: pull new Shopify orders + send "confirmed" WhatsApp ──
-  cron.schedule('0 */6 * * *', async () => {
-    console.log('[CRON] Syncing Shopify orders...');
+  // ── Every 2 hours: auto sync ALL Shopify orders ───────────────
+  cron.schedule('0 */2 * * *', async () => {
+    console.log('[CRON] Auto syncing Shopify orders...');
     try {
-      const shopifyService = require('../services/shopifyService');
-      const orders         = await shopifyService.fetchUnfulfilledOrders(250);
-      let created = 0;
+      const axios    = require('axios');
+      const shopify  = require('../services/shopifyService');
+      const whatsapp = require('../services/whatsappService');
 
-      for (const so of orders) {
+      // Get credentials
+      const { data: connRow } = await supabase
+        .from('settings').select('value').eq('key', 'shopify_connection').maybeSingle();
+      if (!connRow?.value) return console.log('[CRON] Shopify not connected');
+
+      const { shop, accessToken } = JSON.parse(connRow.value);
+      const client = axios.create({
+        baseURL: `https://${shop}/admin/api/2024-10`,
+        headers: { 'X-Shopify-Access-Token': accessToken },
+        timeout: 25000,
+      });
+
+      let totalCreated = 0;
+      let page         = 1;
+      let hasMore      = true;
+
+      while (hasMore) {
+        const { data } = await client.get('/orders.json', {
+          params: { status:'open', fulfillment_status:'unfulfilled', limit:250 },
+        });
+
+        const orders = data.orders || [];
+        if (orders.length === 0) break;
+
+        // Check existing
+        const ids = orders.map(o => String(o.id));
         const { data: existing } = await supabase
-          .from('orders').select('id').eq('shopify_order_id', String(so.id)).maybeSingle();
-        if (existing) continue;
+          .from('orders').select('shopify_order_id').in('shopify_order_id', ids);
+        const existingIds = new Set((existing || []).map(o => o.shopify_order_id));
 
-        const normalized = shopifyService.normalizeOrder(so);
-        const { data: newOrder, error } = await supabase
-          .from('orders').insert(normalized).select().single();
+        const toInsert = orders
+          .filter(o => !existingIds.has(String(o.id)))
+          .map(o => shopify.normalizeOrder(o));
 
-        if (!error && newOrder) {
-          created++;
-          // 📱 Send "confirmed" WhatsApp for new order
-          whatsapp.notifyCustomer('confirmed', newOrder).catch(e =>
-            console.error('[CRON][WhatsApp] confirmed failed:', e.message)
+        if (toInsert.length > 0) {
+          const { data: inserted } = await supabase.from('orders').insert(toInsert).select();
+          totalCreated += inserted?.length || 0;
+          (inserted || []).forEach(o =>
+            whatsapp.notifyCustomer('confirmed', o).catch(() => {})
           );
         }
+
+        hasMore = orders.length === 250;
+        page++;
+
+        // Safety: max 10 pages per run (2500 orders)
+        if (page > 10) break;
+
+        // Small delay between pages
+        await new Promise(r => setTimeout(r, 1000));
       }
-      console.log(`[CRON] Shopify sync: ${created} new orders`);
+
+      console.log(`[CRON] Shopify sync: ${totalCreated} new orders imported`);
     } catch (e) {
-      console.error('[CRON] Shopify sync failed:', e.message);
+      console.error('[CRON] Shopify auto sync failed:', e.message);
     }
   });
+
+  console.log('✅ Cron jobs started: PostEx tracking (hourly), Shopify sync (every 2 hours)');
 }
 
 module.exports = { startCronJobs };
