@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
@@ -9,20 +10,63 @@ function Badge({ status }) {
   return <span className={`badge ${map[status]||'badge-pending'}`}>{labels[status]||status}</span>;
 }
 
+// Date presets
+const DATE_PRESETS = [
+  { label: 'Today',      days: 0  },
+  { label: 'Yesterday',  days: 1  },
+  { label: 'Last 7 days',days: 7  },
+  { label: 'Last 30 days',days: 30 },
+  { label: 'Last 90 days',days: 90 },
+  { label: 'All time',   days: null },
+];
+
+function getDateRange(days) {
+  if (days === null) return { from: null, to: null };
+  const to   = new Date();
+  const from = new Date();
+  if (days === 0) {
+    from.setHours(0, 0, 0, 0);
+    to.setHours(23, 59, 59, 999);
+  } else {
+    from.setDate(from.getDate() - days);
+    from.setHours(0, 0, 0, 0);
+  }
+  return {
+    from: from.toISOString().split('T')[0],
+    to:   to.toISOString().split('T')[0],
+  };
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
   const qc = useQueryClient();
 
-  // Real data from API
+  // Date filter state
+  const [selectedPreset, setSelectedPreset] = useState('Last 7 days');
+  const [customFrom,     setCustomFrom]     = useState('');
+  const [customTo,       setCustomTo]       = useState('');
+  const [showDatePicker, setShowDatePicker] = useState(false);
+
+  const preset   = DATE_PRESETS.find(p => p.label === selectedPreset);
+  const dateRange = customFrom && customTo
+    ? { from: customFrom, to: customTo }
+    : getDateRange(preset?.days ?? 7);
+
+  // Fetch orders with date filter
   const { data: ordersData, isLoading } = useQuery({
-    queryKey: ['orders', 'all', '', 1],
-    queryFn: () => ordersApi.list({ status: 'all', limit: 6 }),
+    queryKey: ['orders-dashboard', dateRange.from, dateRange.to],
+    queryFn:  () => ordersApi.list({
+      status: 'all',
+      limit:  50,
+      ...(dateRange.from && { date_from: dateRange.from }),
+      ...(dateRange.to   && { date_to:   dateRange.to   }),
+    }),
     staleTime: 30000,
   });
 
-  const { data: allOrders } = useQuery({
-    queryKey: ['orders-stats'],
-    queryFn: () => ordersApi.list({ status: 'all', limit: 1 }),
+  const { data: totalData } = useQuery({
+    queryKey: ['orders-total'],
+    queryFn:  () => ordersApi.list({ status: 'all', limit: 1 }),
     staleTime: 60000,
   });
 
@@ -38,32 +82,87 @@ export default function Dashboard() {
     onError:   e => toast.error(e.response?.data?.error || e.message),
   });
 
-  const recentOrders = ordersData?.orders || [];
-  const totalOrders  = allOrders?.total   || 0;
+  const orders       = ordersData?.orders || [];
+  const totalOrders  = totalData?.total   || 0;
+  const totalRevenue = orders.reduce((s, o) => s + Number(o.total_price||0), 0);
+  const unbooked     = orders.filter(o => !o.postex_cn).length;
+  const pending      = orders.filter(o => o.status === 'pending').length;
 
-  // Calculate revenue from recent orders
-  const totalRevenue = recentOrders.reduce((sum, o) => sum + Number(o.total_price || 0), 0);
+  // Bar chart — group by day
+  const barData = (() => {
+    const days = 7;
+    const result = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().split('T')[0];
+      const dayLabel = d.toLocaleDateString('en-US', { weekday: 'short' });
+      const count = orders.filter(o => o.created_at?.startsWith(dateStr)).length;
+      result.push({ day: dayLabel, val: count, date: dateStr });
+    }
+    return result;
+  })();
+  const maxBar = Math.max(...barData.map(b => b.val), 1);
 
-  // Count by status
-  const pending   = recentOrders.filter(o => o.status === 'pending').length;
-  const unbooked  = recentOrders.filter(o => !o.postex_cn).length;
-
-  // Bar chart — last 7 days from real orders
-  const days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  const today = new Date().getDay();
-  const BAR_DATA = days.map((day, i) => {
-    const count = recentOrders.filter(o => {
-      const d = new Date(o.created_at);
-      return d.getDay() === ((today - 6 + i + 7) % 7);
-    }).length;
-    return { day, val: count };
-  });
-  const maxBar = Math.max(...BAR_DATA.map(b => b.val), 1);
+  // Display label for date filter
+  const dateLabel = customFrom && customTo
+    ? `${customFrom} → ${customTo}`
+    : selectedPreset;
 
   return (
     <div className="page-shell">
+      {/* Topbar */}
       <div className="topbar">
         <div className="topbar-title">Dashboard</div>
+
+        {/* Date Filter */}
+        <div style={{ position:'relative' }}>
+          <button
+            onClick={() => setShowDatePicker(!showDatePicker)}
+            style={{ display:'flex', alignItems:'center', gap:8, padding:'7px 14px', borderRadius:8, border:'1.5px solid var(--green-200)', background:'var(--green-50)', color:'var(--green-700)', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'var(--font)', whiteSpace:'nowrap' }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+            {dateLabel}
+            <span style={{ fontSize:10 }}>▼</span>
+          </button>
+
+          {showDatePicker && (
+            <div style={{ position:'absolute', top:'100%', right:0, marginTop:6, background:'#fff', border:'1px solid var(--gray-200)', borderRadius:12, boxShadow:'var(--shadow-lg)', zIndex:100, width:280, padding:16 }}>
+              {/* Presets */}
+              <div style={{ fontSize:11, fontWeight:700, color:'var(--gray-400)', textTransform:'uppercase', letterSpacing:'0.6px', marginBottom:10 }}>Quick Select</div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:6, marginBottom:16 }}>
+                {DATE_PRESETS.map(p => (
+                  <button key={p.label} onClick={() => { setSelectedPreset(p.label); setCustomFrom(''); setCustomTo(''); setShowDatePicker(false); }}
+                    style={{ padding:'6px 10px', borderRadius:7, border:`1.5px solid ${selectedPreset===p.label && !customFrom ? 'var(--green-600)' : 'var(--gray-200)'}`, background: selectedPreset===p.label && !customFrom ? 'var(--green-50)' : '#fff', color: selectedPreset===p.label && !customFrom ? 'var(--green-700)' : 'var(--gray-600)', fontSize:12, fontWeight:500, cursor:'pointer', fontFamily:'var(--font)', textAlign:'left' }}>
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Custom range */}
+              <div style={{ fontSize:11, fontWeight:700, color:'var(--gray-400)', textTransform:'uppercase', letterSpacing:'0.6px', marginBottom:8 }}>Custom Range</div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:10 }}>
+                <div>
+                  <div style={{ fontSize:11, color:'var(--gray-500)', marginBottom:4 }}>From</div>
+                  <input type="date" value={customFrom} onChange={e => { setCustomFrom(e.target.value); setSelectedPreset(''); }}
+                    style={{ width:'100%', padding:'6px 8px', border:'1.5px solid var(--gray-200)', borderRadius:7, fontSize:12, fontFamily:'var(--font)', color:'var(--gray-900)', outline:'none', boxSizing:'border-box' }}/>
+                </div>
+                <div>
+                  <div style={{ fontSize:11, color:'var(--gray-500)', marginBottom:4 }}>To</div>
+                  <input type="date" value={customTo} onChange={e => { setCustomTo(e.target.value); setSelectedPreset(''); }}
+                    style={{ width:'100%', padding:'6px 8px', border:'1.5px solid var(--gray-200)', borderRadius:7, fontSize:12, fontFamily:'var(--font)', color:'var(--gray-900)', outline:'none', boxSizing:'border-box' }}/>
+                </div>
+              </div>
+              {customFrom && customTo && (
+                <button onClick={() => setShowDatePicker(false)}
+                  style={{ width:'100%', padding:'8px', borderRadius:7, border:'none', background:'var(--green-600)', color:'#fff', fontSize:13, fontWeight:600, cursor:'pointer', fontFamily:'var(--font)' }}>
+                  Apply Range
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
         <button className="btn" disabled={trackMutation.isPending} onClick={() => trackMutation.mutate()}>
           {trackMutation.isPending ? '...' : '📡 Sync Tracking'}
         </button>
@@ -73,28 +172,42 @@ export default function Dashboard() {
       </div>
 
       <div className="content-scroll">
-        {/* Metrics — real data */}
+        {/* Date context banner */}
+        <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:16, fontSize:12.5, color:'var(--gray-500)' }}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+          Showing data for: <strong style={{ color:'var(--green-700)' }}>{dateLabel}</strong>
+          <span style={{ color:'var(--gray-300)' }}>•</span>
+          <span>{orders.length} orders in this period</span>
+          {(customFrom || selectedPreset !== 'All time') && (
+            <button onClick={() => { setSelectedPreset('All time'); setCustomFrom(''); setCustomTo(''); }}
+              style={{ marginLeft:'auto', fontSize:11.5, color:'var(--gray-400)', background:'none', border:'none', cursor:'pointer', textDecoration:'underline' }}>
+              Clear filter
+            </button>
+          )}
+        </div>
+
+        {/* Metrics */}
         <div className="grid-4" style={{ marginBottom:18 }}>
           <div className="metric-card">
-            <div className="metric-label">Total Orders</div>
-            <div className="metric-value">{totalOrders.toLocaleString()}</div>
-            <div className="metric-delta up">Live from Shopify</div>
+            <div className="metric-label">Orders (Period)</div>
+            <div className="metric-value">{orders.length}</div>
+            <div className="metric-delta up">of {totalOrders.toLocaleString()} total</div>
             <div className="metric-accent green"/>
           </div>
           <div className="metric-card">
-            <div className="metric-label">Revenue (Recent)</div>
+            <div className="metric-label">Revenue (Period)</div>
             <div className="metric-value">₨{totalRevenue.toLocaleString()}</div>
-            <div className="metric-delta up">Last 6 orders</div>
+            <div className="metric-delta up">{dateLabel}</div>
             <div className="metric-accent teal"/>
           </div>
           <div className="metric-card">
-            <div className="metric-label">Unbooked Orders</div>
+            <div className="metric-label">Unbooked</div>
             <div className="metric-value">{unbooked}</div>
             <div className="metric-delta down">Needs PostEx booking</div>
             <div className="metric-accent amber"/>
           </div>
           <div className="metric-card">
-            <div className="metric-label">Pending Orders</div>
+            <div className="metric-label">Pending</div>
             <div className="metric-value">{pending}</div>
             <div className="metric-delta down">Awaiting processing</div>
             <div className="metric-accent blue"/>
@@ -103,6 +216,7 @@ export default function Dashboard() {
 
         {/* Charts */}
         <div className="grid-2" style={{ marginBottom:18 }}>
+          {/* Bar chart */}
           <div className="card">
             <div className="card-header">
               <span className="card-title">Orders — Last 7 Days</span>
@@ -110,11 +224,11 @@ export default function Dashboard() {
             </div>
             <div className="card-body">
               <div style={{ display:'flex', alignItems:'flex-end', gap:8, height:110 }}>
-                {BAR_DATA.map((b, i) => (
+                {barData.map((b, i) => (
                   <div key={b.day} style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', gap:5 }}>
                     <span style={{ fontSize:10, color:'var(--gray-600)', fontWeight:600 }}>{b.val}</span>
                     <div style={{ width:'100%', height:80, background:'var(--gray-100)', borderRadius:'5px 5px 0 0', display:'flex', alignItems:'flex-end' }}>
-                      <div style={{ width:'100%', borderRadius:'5px 5px 0 0', height:`${Math.max((b.val/maxBar)*100, b.val>0?8:0)}%`, background: i===3?'linear-gradient(180deg,#22c55e,#15803d)':'linear-gradient(180deg,#4ade80,#16a34a)' }}/>
+                      <div style={{ width:'100%', borderRadius:'5px 5px 0 0', height:`${Math.max((b.val/maxBar)*100, b.val>0?6:0)}%`, background: i===6?'linear-gradient(180deg,#22c55e,#15803d)':'linear-gradient(180deg,#4ade80,#16a34a)' }}/>
                     </div>
                     <span style={{ fontSize:10, color:'var(--gray-400)', fontWeight:500 }}>{b.day}</span>
                   </div>
@@ -123,6 +237,7 @@ export default function Dashboard() {
             </div>
           </div>
 
+          {/* Status breakdown */}
           <div className="card">
             <div className="card-header"><span className="card-title">Orders by Status</span></div>
             <div className="card-body">
@@ -134,17 +249,17 @@ export default function Dashboard() {
                   { label:'Delivered',  color:'#16a34a', status:'delivered'  },
                   { label:'Cancelled',  color:'#ef4444', status:'cancelled'  },
                 ].map(s => {
-                  const count = recentOrders.filter(o => o.status === s.status).length;
-                  const pct   = totalOrders > 0 ? Math.round((count / recentOrders.length) * 100) : 0;
+                  const count = orders.filter(o => o.status === s.status).length;
+                  const pct   = orders.length > 0 ? Math.round((count/orders.length)*100) : 0;
                   return (
                     <div key={s.label} style={{ display:'flex', alignItems:'center', gap:10, fontSize:12.5, cursor:'pointer' }}
-                      onClick={() => navigate(`/orders?status=${s.status}`)}>
+                      onClick={() => navigate('/orders')}>
                       <div style={{ width:9, height:9, borderRadius:3, background:s.color, flexShrink:0 }}/>
                       <span style={{ color:'var(--gray-600)', flex:1 }}>{s.label}</span>
                       <div style={{ width:80, height:5, background:'var(--gray-100)', borderRadius:3, overflow:'hidden' }}>
                         <div style={{ width:`${pct}%`, height:'100%', background:s.color, borderRadius:3 }}/>
                       </div>
-                      <span style={{ fontWeight:700, color:'var(--gray-900)', fontFamily:'var(--font-mono)', fontSize:12, width:20, textAlign:'right' }}>{count}</span>
+                      <span style={{ fontWeight:700, color:'var(--gray-900)', fontFamily:'var(--font-mono)', fontSize:12, width:24, textAlign:'right' }}>{count}</span>
                     </div>
                   );
                 })}
@@ -153,9 +268,11 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Recent Orders — real data */}
+        {/* Recent Orders */}
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
-          <div style={{ fontSize:14, fontWeight:600, color:'var(--gray-900)' }}>Recent Orders</div>
+          <div style={{ fontSize:14, fontWeight:600, color:'var(--gray-900)' }}>
+            Orders <span style={{ fontSize:12, fontWeight:400, color:'var(--gray-400)' }}>— {dateLabel}</span>
+          </div>
           <span className="card-link" onClick={() => navigate('/orders')}>See all →</span>
         </div>
         <div className="table-wrap">
@@ -170,12 +287,12 @@ export default function Dashboard() {
               {isLoading && (
                 <tr><td colSpan={7} style={{ textAlign:'center', padding:30, color:'var(--gray-400)' }}>Loading...</td></tr>
               )}
-              {!isLoading && recentOrders.length === 0 && (
+              {!isLoading && orders.length === 0 && (
                 <tr><td colSpan={7} style={{ textAlign:'center', padding:30, color:'var(--gray-400)' }}>
-                  No orders yet — click Sync Shopify to import orders
+                  No orders found for <strong>{dateLabel}</strong>
                 </td></tr>
               )}
-              {recentOrders.map(o => (
+              {orders.slice(0, 10).map(o => (
                 <tr key={o.id} onClick={() => navigate(`/orders/${o.id}`)}>
                   <td className="td-mono">{o.shopify_order_number}</td>
                   <td>
@@ -190,13 +307,21 @@ export default function Dashboard() {
                     </span>
                   </td>
                   <td><Badge status={o.status}/></td>
-                  <td className="td-muted">{new Date(o.created_at).toLocaleDateString('en-PK',{day:'2-digit',month:'short'})}</td>
+                  <td className="td-muted">
+                    {new Date(o.created_at).toLocaleDateString('en-PK', { day:'2-digit', month:'short', year:'numeric' })}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       </div>
+
+      {/* Close date picker on outside click */}
+      {showDatePicker && (
+        <div onClick={() => setShowDatePicker(false)}
+          style={{ position:'fixed', inset:0, zIndex:99 }}/>
+      )}
     </div>
   );
 }
