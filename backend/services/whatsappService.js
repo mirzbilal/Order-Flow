@@ -1,143 +1,113 @@
 // backend/services/whatsappService.js
-// WhatsApp via @whiskeysockets/baileys - No Chrome needed
+// Safe WhatsApp service - won't crash if baileys fails
 
-let makeWASocket, DisconnectReason, useMultiFileAuthState, Boom, pino;
+let waClient = null;
+let qrCode   = null;
+let isReady  = false;
+let initErr  = null;
 
-try {
-  const baileys = require('@whiskeysockets/baileys');
-  makeWASocket = baileys.default;
-  DisconnectReason = baileys.DisconnectReason;
-  useMultiFileAuthState = baileys.useMultiFileAuthState;
-  Boom = require('@hapi/boom').Boom;
-  pino = require('pino');
-} catch (e) {
-  console.error('[WhatsApp] Failed to load baileys:', e.message);
-}
-
-const fs      = require('fs');
-const supabase = require('../lib/supabase');
-
-const AUTH_PATH = '/tmp/baileys-auth';
-
-let sock      = null;
-let qrCode    = null;
-let isReady   = false;
-let isIniting = false;
-let initError = null;
-
-// ─── Initialize ───────────────────────────────────────────────
+// Try to load baileys - if it fails, WhatsApp just won't work
 async function initClient() {
-  if (!makeWASocket) {
-    initError = 'Baileys not installed — run npm install';
-    console.error('[WhatsApp]', initError);
-    return;
-  }
-  if (isIniting) return;
-  isIniting = true;
-  initError = null;
-
   try {
+    const baileys = require('@whiskeysockets/baileys');
+    const makeWASocket = baileys.default;
+    const { DisconnectReason, useMultiFileAuthState } = baileys;
+    const { Boom } = require('@hapi/boom');
+    const pino = require('pino');
+    const fs   = require('fs');
+
+    const AUTH_PATH = '/tmp/wa-auth';
     if (!fs.existsSync(AUTH_PATH)) fs.mkdirSync(AUTH_PATH, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_PATH);
 
-    sock = makeWASocket({
+    waClient = makeWASocket({
       auth:   state,
       logger: pino({ level: 'silent' }),
       browser: ['OrderFlow', 'Chrome', '1.0'],
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
-      keepAliveIntervalMs: 10000,
     });
 
-    sock.ev.on('connection.update', async (update) => {
+    waClient.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        qrCode  = qr;
-        isReady = false;
-        console.log('[WhatsApp] QR Code ready — scan with your phone');
-      }
-
+      if (qr) { qrCode = qr; isReady = false; console.log('[WA] QR ready'); }
+      if (connection === 'open')  { isReady = true; qrCode = null; console.log('[WA] ✅ Connected!'); }
       if (connection === 'close') {
-        isReady   = false;
-        isIniting = false;
+        isReady = false;
         const code = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
-        console.log('[WhatsApp] Disconnected, code:', code, 'reconnect:', shouldReconnect);
-        if (shouldReconnect) {
-          setTimeout(() => initClient(), 5000);
-        } else {
-          fs.rmSync(AUTH_PATH, { recursive: true, force: true });
-          qrCode = null;
-          sock   = null;
-        }
-      }
-
-      if (connection === 'open') {
-        isReady   = true;
-        isIniting = false;
-        qrCode    = null;
-        console.log('[WhatsApp] ✅ Connected and ready!');
+        if (code !== DisconnectReason.loggedOut) setTimeout(initClient, 5000);
+        else { fs.rmSync(AUTH_PATH, { recursive:true, force:true }); qrCode=null; waClient=null; }
       }
     });
-
-    sock.ev.on('creds.update', saveCreds);
-
+    waClient.ev.on('creds.update', saveCreds);
+    console.log('[WA] Initializing...');
   } catch (err) {
-    isIniting = false;
-    initError = err.message;
-    console.error('[WhatsApp] Init error:', err.message);
-    setTimeout(() => initClient(), 15000);
+    initErr = err.message;
+    console.error('[WA] Could not start:', err.message);
   }
 }
 
 function getStatus() {
-  return { isReady, hasQr: !!qrCode, qrCode, error: initError, isIniting };
+  return { isReady, hasQr: !!qrCode, qrCode, error: initErr };
 }
 
 function formatPhone(phone) {
   if (!phone) return null;
-  let d = phone.replace(/\D/g, '');
+  let d = String(phone).replace(/\D/g, '');
   if (d.startsWith('0') && d.length === 11) d = '92' + d.slice(1);
   else if (d.length === 10) d = '92' + d;
   return d + '@s.whatsapp.net';
 }
 
 async function sendMessage(phone, message) {
-  if (!isReady || !sock) {
-    console.warn('[WhatsApp] Not ready — skipping for', phone);
-    return { status: 'skipped' };
+  if (!isReady || !waClient) return { status: 'skipped', reason: 'not connected' };
+  try {
+    const jid = formatPhone(phone);
+    if (!jid) return { status: 'skipped', reason: 'invalid phone' };
+    await waClient.sendMessage(jid, { text: message });
+    return { status: 'sent' };
+  } catch (err) {
+    console.error('[WA] Send error:', err.message);
+    return { status: 'failed', error: err.message };
   }
-  const jid = formatPhone(phone);
-  if (!jid) return { status: 'skipped', reason: 'invalid phone' };
-  await sock.sendMessage(jid, { text: message });
-  return { status: 'sent' };
 }
 
-function msgConfirmed(o) { return `Hello ${o.customer_name}! 👋\n\n✅ *Order Confirmed*\n\nOrder *#${o.shopify_order_number}* received.\n🛍 ${o.order_detail||'Your items'}\n💰 PKR ${Number(o.total_price||0).toLocaleString()}\n💳 ${o.payment_method||'COD'}\n📍 ${o.shipping_city}\n\nThank you! 🙏`; }
-function msgBooked(o)    { return `Hello ${o.customer_name}! 📦\n\nOrder *#${o.shopify_order_number}* booked with PostEx.\n\n🔖 Tracking: *${o.postex_cn}*\n📍 ${o.shipping_city}\n\nTrack: https://postex.pk/tracking?cn=${o.postex_cn} 🚚`; }
-function msgShipped(o)   { return `Hello ${o.customer_name}! 🚚\n\nOrder *#${o.shopify_order_number}* is on the way!\n\n📦 PostEx: *${o.postex_cn}*\n\nTrack: https://postex.pk/tracking?cn=${o.postex_cn}\n\nKeep your phone available 📞`; }
-function msgDelivered(o) { return `Hello ${o.customer_name}! 🎉\n\nOrder *#${o.shopify_order_number}* delivered!\n\nThank you for shopping with us! ⭐`; }
+function buildMessage(event, order) {
+  const n = order.customer_name || 'Customer';
+  const num = `#${order.shopify_order_number}`;
+  const amt = `PKR ${Number(order.total_price||0).toLocaleString()}`;
+  const city = order.shipping_city || '';
+  const cn = order.postex_cn || '';
+  const msgs = {
+    confirmed: `Hello ${n}! 👋\n\n✅ *Order Confirmed*\n\nOrder *${num}* received.\n🛍 ${order.order_detail||'Your items'}\n💰 ${amt}\n💳 ${order.payment_method||'COD'}\n📍 ${city}\n\nThank you! 🙏`,
+    booked:    `Hello ${n}! 📦\n\nOrder *${num}* booked with PostEx.\n\n🔖 Tracking: *${cn}*\n📍 ${city}\n\nTrack: https://postex.pk/tracking?cn=${cn} 🚚`,
+    shipped:   `Hello ${n}! 🚚\n\nOrder *${num}* is on the way!\n\n📦 PostEx: *${cn}*\nTrack: https://postex.pk/tracking?cn=${cn}\n\nKeep phone available 📞`,
+    delivered: `Hello ${n}! 🎉\n\nOrder *${num}* has been delivered!\n\nThank you for shopping! ⭐`,
+  };
+  return msgs[event] || null;
+}
 
 async function notifyCustomer(event, order) {
   if (!order?.customer_phone) return null;
-  const templates = { confirmed:msgConfirmed, booked:msgBooked, shipped:msgShipped, delivered:msgDelivered };
-  const fn = templates[event];
-  if (!fn) return null;
+  const message = buildMessage(event, order);
+  if (!message) return null;
   try {
-    const message = fn(order);
-    const result  = await sendMessage(order.customer_phone, message);
-    await supabase.from('whatsapp_logs').insert({ order_id:order.id, phone:order.customer_phone, event, message, status:result.status||'sent' }).catch(()=>{});
+    const result = await sendMessage(order.customer_phone, message);
+    // Log to DB silently
+    try {
+      const supabase = require('../lib/supabase');
+      await supabase.from('whatsapp_logs').insert({
+        order_id: order.id, phone: order.customer_phone,
+        event, message, status: result.status,
+      });
+    } catch (_) {}
     return result;
   } catch (err) {
-    console.error('[WhatsApp] notifyCustomer error:', err.message);
-    await supabase.from('whatsapp_logs').insert({ order_id:order.id, phone:order.customer_phone, event, status:'failed', error:err.message }).catch(()=>{});
+    console.error('[WA] notifyCustomer error:', err.message);
     return null;
   }
 }
 
-// Start on load
-initClient().catch(e => console.error('[WhatsApp] Startup:', e.message));
+// Start safely - don't crash the app if baileys fails
+initClient().catch(e => console.error('[WA] Init failed:', e.message));
 
 module.exports = { sendMessage, notifyCustomer, getStatus, initClient };
