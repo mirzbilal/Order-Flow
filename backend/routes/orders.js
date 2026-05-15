@@ -10,13 +10,14 @@ const whatsapp  = require('../services/whatsappService');
 router.get('/', async (req, res) => {
   try {
     const { status, channel, search, page = 1, limit = 20, date_from, date_to } = req.query;
+    const safeLimit = Math.min(Number(limit), 10000); // max 10000 per request
     const offset = (Number(page) - 1) * Number(limit);
 
     let query = supabase
       .from('orders')
       .select('*', { count: 'exact' })
       .order('created_at', { ascending: false })
-      .range(offset, offset + Number(limit) - 1);
+      .range(offset, offset + safeLimit - 1);
 
     if (status && status !== 'all') query = query.eq('status', status);
     if (channel) query = query.eq('channel', channel);
