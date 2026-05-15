@@ -9,7 +9,7 @@ const whatsapp  = require('../services/whatsappService');
 // ─── GET /api/orders ─────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { status, channel, search, page = 1, limit = 20 } = req.query;
+    const { status, channel, search, page = 1, limit = 20, date_from, date_to } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
     let query = supabase
@@ -23,6 +23,8 @@ router.get('/', async (req, res) => {
     if (search)  query = query.or(
       `customer_name.ilike.%${search}%,shopify_order_number.ilike.%${search}%,postex_cn.ilike.%${search}%`
     );
+    if (date_from) query = query.gte('created_at', `${date_from}T00:00:00.000Z`);
+    if (date_to)   query = query.lte('created_at', `${date_to}T23:59:59.999Z`);
 
     const { data, error, count } = await query;
     if (error) throw error;
