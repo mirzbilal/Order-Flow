@@ -131,7 +131,7 @@ export default function App() {
                 onMouseEnter={e=>e.currentTarget.style.background='var(--gray-50)'}
                 onMouseLeave={e=>e.currentTarget.style.background='transparent'}
               >
-                <div style={{ width:32, height:32, borderRadius:'50%', background:'linear-gradient(135deg, #22c55e 0%, #15803d 100%)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:11.5, fontWeight:700, color:'#fff', flexShrink:0 }}>AK</div>
+                <div style={{ width:32, height:32, borderRadius:'50%', background:'linear-gradient(135deg, #22c55e 0%, #15803d 100%)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:11.5, fontWeight:700, color:'#fff', flexShrink:0 }}>MB</div>
                 <div style={{ flex:1, minWidth:0 }}>
                   <div style={{ fontSize:13, fontWeight:600, color:'var(--gray-900)' }}>Mirza Bilal</div>
                   <div style={{ fontSize:11, color:'var(--gray-400)' }}>Administrator</div>
