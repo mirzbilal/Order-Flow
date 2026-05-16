@@ -1,67 +1,67 @@
-require('dotenv').config();
-require('express-async-errors');
+const express  = require('express');
+const router   = express.Router();
+const axios    = require('axios');
+const supabase = require('../lib/supabase');
 
-const express = require('express');
-const cors    = require('cors');
-const app     = express();
-const PORT    = process.env.PORT || 4000;
-
-// ─── CORS ─────────────────────────────────────────────────────
-app.use(cors({ origin: '*', credentials: true }));
-
-// ─── Body parsing ─────────────────────────────────────────────
-app.use('/api/shopify/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// ─── Safe route loader ────────────────────────────────────────
-function safeRequire(path) {
-  try { return require(path); }
-  catch (e) { console.error(`[Route] Missing: ${path} — ${e.message}`); return null; }
-}
-
-// ─── Routes ───────────────────────────────────────────────────
-const routes = [
-  ['/api/orders',    './routes/orders'],
-  ['/api/shopify',   './routes/shopify'],
-  ['/api/shopify',   './routes/shopifyConnect'],
-  ['/api/postex',    './routes/postex'],
-  ['/api/postex',    './routes/postexConnect'],
-  ['/api/analytics', './routes/analytics'],
-  ['/api/whatsapp',  './routes/whatsapp'],
-  ['/api/whatsapp',  './routes/whatsappMessages'],
+const URLS = [
+  'https://api.postex.pk/services/integration/api',
+  'https://merchantapi.postex.pk/services/integration/api',
 ];
 
-routes.forEach(([path, file]) => {
-  const router = safeRequire(file);
-  if (router) app.use(path, router);
-  else console.warn(`[Server] Skipping missing route: ${file}`);
-});
+async function getConn() {
+  const { data } = await supabase.from('settings').select('value').eq('key','postex_connection').maybeSingle();
+  return data?.value ? JSON.parse(data.value) : null;
+}
 
-// ─── Root ─────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({
-  app: 'OrderFlow API', status: 'running', version: '1.0.0',
-  time: new Date().toISOString(),
-}));
-
-// ─── Health ───────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
-
-// ─── 404 ──────────────────────────────────────────────────────
-app.use((req, res) => res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` }));
-
-// ─── Error handler ────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error('[ERROR]', err.message);
-  res.status(500).json({ error: err.message || 'Internal server error' });
-});
-
-// ─── Start ────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅  OrderFlow API running on port ${PORT}`);
-  console.log(`🌍  Environment: ${process.env.NODE_ENV || 'development'}`);
+router.get('/status', async (req, res) => {
   try {
-    const { startCronJobs } = require('./cron/trackingSync');
-    if (process.env.NODE_ENV !== 'test') startCronJobs();
-  } catch (e) { console.error('[CRON] Failed to start:', e.message); }
+    const c = await getConn();
+    if (!c) return res.json({ connected: false });
+    res.json({ connected: true, merchantCode: c.merchantCode, pickupAddressCode: c.pickupAddressCode, connectedAt: c.connectedAt });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
+router.post('/connect', async (req, res) => {
+  try {
+    const { token, merchantCode, pickupAddressCode } = req.body;
+    if (!token || !merchantCode || !pickupAddressCode) return res.status(400).json({ error: 'All fields required' });
+    let baseUrl = null;
+    for (const url of URLS) {
+      try {
+        const r = await axios.get(`${url}/order/get-operational-cities`, { headers:{ token }, timeout:8000 });
+        if (r.data?.statusCode === '200') { baseUrl = url; break; }
+      } catch(_) {}
+    }
+    if (!baseUrl) return res.status(400).json({ error: 'Cannot connect to PostEx — check your token' });
+    const r = await axios.get(`${baseUrl}/order/get-operational-cities`, { headers:{ token }, timeout:8000 });
+    await supabase.from('settings').upsert({ key:'postex_connection', value: JSON.stringify({ token, merchantCode, pickupAddressCode, baseUrl, connectedAt: new Date().toISOString(), citiesCount: r.data?.dist?.length||0 }) }, { onConflict:'key' });
+    res.json({ success: true, merchantCode, citiesCount: r.data?.dist?.length||0 });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/disconnect', async (req, res) => {
+  try {
+    await supabase.from('settings').upsert({ key:'postex_connection', value: null }, { onConflict:'key' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/test', async (req, res) => {
+  try {
+    const c = await getConn();
+    if (!c) return res.status(400).json({ error: 'PostEx not connected' });
+    const r = await axios.get(`${c.baseUrl}/order/get-operational-cities`, { headers:{ token: c.token }, timeout:10000 });
+    res.json({ success: true, cities: r.data?.dist?.length||0, status: r.data?.statusMessage });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/cities', async (req, res) => {
+  try {
+    const c = await getConn();
+    if (!c) return res.status(400).json({ error: 'Not connected' });
+    const r = await axios.get(`${c.baseUrl}/order/get-operational-cities`, { headers:{ token: c.token }, timeout:10000 });
+    res.json(r.data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+module.exports = router;
