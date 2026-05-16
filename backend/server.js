@@ -3,7 +3,6 @@ require('express-async-errors');
 
 const express = require('express');
 const cors    = require('cors');
-const crypto  = require('crypto');
 const app     = express();
 const PORT    = process.env.PORT || 4000;
 
@@ -15,14 +14,29 @@ app.use('/api/shopify/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// ─── Safe route loader ────────────────────────────────────────
+function safeRequire(path) {
+  try { return require(path); }
+  catch (e) { console.error(`[Route] Missing: ${path} — ${e.message}`); return null; }
+}
+
 // ─── Routes ───────────────────────────────────────────────────
-app.use('/api/orders',    require('./routes/orders'));
-app.use('/api/shopify',   require('./routes/shopify'));
-app.use('/api/shopify',   require('./routes/shopifyConnect'));
-app.use('/api/postex',    require('./routes/postex'));
-app.use('/api/postex',    require('./routes/postexConnect'));
-app.use('/api/analytics', require('./routes/analytics'));
-app.use('/api/whatsapp',  require('./routes/whatsapp'));
+const routes = [
+  ['/api/orders',    './routes/orders'],
+  ['/api/shopify',   './routes/shopify'],
+  ['/api/shopify',   './routes/shopifyConnect'],
+  ['/api/postex',    './routes/postex'],
+  ['/api/postex',    './routes/postexConnect'],
+  ['/api/analytics', './routes/analytics'],
+  ['/api/whatsapp',  './routes/whatsapp'],
+  ['/api/whatsapp',  './routes/whatsappMessages'],
+];
+
+routes.forEach(([path, file]) => {
+  const router = safeRequire(file);
+  if (router) app.use(path, router);
+  else console.warn(`[Server] Skipping missing route: ${file}`);
+});
 
 // ─── Root ─────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
@@ -46,12 +60,8 @@ app.use((err, req, res, next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅  OrderFlow API running on port ${PORT}`);
   console.log(`🌍  Environment: ${process.env.NODE_ENV || 'development'}`);
-
-  // Start cron jobs
   try {
     const { startCronJobs } = require('./cron/trackingSync');
     if (process.env.NODE_ENV !== 'test') startCronJobs();
-  } catch (e) {
-    console.error('[CRON] Failed to start:', e.message);
-  }
+  } catch (e) { console.error('[CRON] Failed to start:', e.message); }
 });
