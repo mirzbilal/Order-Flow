@@ -1,23 +1,25 @@
 // backend/services/whatsappService.js
-// WhatsApp via @whiskeysockets/baileys - FREE, no monthly fees
-// Runs perfectly on Railway (supports WebSockets)
+// Safe WhatsApp service - won't crash server if baileys fails
 
-let sock      = null;
-let qrCode    = null;
-let isReady   = false;
-let isIniting = false;
-let initError = null;
+let sock = null, qrCode = null, isReady = false, initError = null;
 
-async function initClient() {
-  if (isIniting) return;
-  isIniting = true;
-  initError = null;
-  console.log('[WA] Starting baileys...');
+function getStatus() {
+  return { isReady, hasQr: !!qrCode, qrCode, error: initError };
+}
 
+function initClient() {
+  // Start async - don't block server startup
+  setTimeout(() => _init().catch(e => {
+    initError = e.message;
+    console.error('[WA] Failed to start:', e.message);
+  }), 3000);
+}
+
+async function _init() {
   try {
     const baileys = require('@whiskeysockets/baileys');
-    const makeWASocket          = baileys.default;
-    const { DisconnectReason, useMultiFileAuthState } = baileys;
+    const makeWASocket = baileys.default;
+    const { DisconnectReason, useMultiFileAuthState, Browsers } = baileys;
     const pino = require('pino');
     const fs   = require('fs');
 
@@ -25,105 +27,59 @@ async function initClient() {
     if (!fs.existsSync(AUTH)) fs.mkdirSync(AUTH, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH);
-    console.log('[WA] Auth state loaded');
 
-    const { Browsers } = baileys;
     sock = makeWASocket({
       auth:   state,
       logger: pino({ level: 'silent' }),
       browser: Browsers.ubuntu('Chrome'),
-      syncFullHistory:              false,
-      markOnlineOnConnect:          false,
-      generateHighQualityLinkPreview: false,
-      connectTimeoutMs:             60000,
-      keepAliveIntervalMs:          25000,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
     });
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
-      console.log('[WA] connection.update:', connection || 'pending', 'hasQR:', !!qr);
-
-      if (qr) {
-        qrCode    = qr;
-        isReady   = false;
-        isIniting = false;
-        console.log('[WA] ✅ QR Code ready — scan with WhatsApp!');
-      }
-
-      if (connection === 'open') {
-        isReady   = true;
-        isIniting = false;
-        qrCode    = null;
-        console.log('[WA] ✅ WhatsApp Connected!');
-      }
-
+      if (qr) { qrCode = qr; isReady = false; console.log('[WA] QR ready!'); }
+      if (connection === 'open')  { isReady = true; qrCode = null; console.log('[WA] ✅ Connected!'); }
       if (connection === 'close') {
-        isReady   = false;
-        isIniting = false;
+        isReady = false;
         const code = lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = code === DisconnectReason.loggedOut;
-        console.log('[WA] Disconnected. Code:', code, 'LoggedOut:', loggedOut);
-        if (!loggedOut) {
-          console.log('[WA] Reconnecting in 5s...');
-          setTimeout(() => initClient(), 5000);
-        } else {
-          try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch(_) {}
-          sock   = null;
-          qrCode = null;
-        }
+        if (code !== DisconnectReason.loggedOut) setTimeout(() => _init(), 10000);
+        else { sock = null; qrCode = null; try { fs.rmSync(AUTH, { recursive:true, force:true }); } catch(_){} }
       }
     });
-
     sock.ev.on('creds.update', saveCreds);
-    console.log('[WA] Socket created, waiting for QR...');
-
+    console.log('[WA] Baileys started');
   } catch (err) {
-    isIniting = false;
     initError = err.message;
     console.error('[WA] Init error:', err.message);
-    setTimeout(() => initClient(), 15000);
   }
-}
-
-function getStatus() {
-  return { isReady, hasQr: !!qrCode, qrCode, error: initError, isIniting };
 }
 
 function formatPhone(phone) {
   if (!phone) return null;
   let d = String(phone).replace(/\D/g, '');
   if (d.startsWith('0') && d.length === 11) d = '92' + d.slice(1);
-  else if (d.length === 10) d = '92' + d;
   return d + '@s.whatsapp.net';
 }
 
 async function sendMessage(phone, message) {
-  if (!isReady || !sock) {
-    console.warn('[WA] Not ready — skipping for', phone);
-    return { status: 'skipped' };
-  }
+  if (!isReady || !sock) return { status: 'skipped' };
   try {
-    const jid = formatPhone(phone);
-    if (!jid) return { status: 'skipped', reason: 'invalid phone' };
-    await sock.sendMessage(jid, { text: message });
-    console.log('[WA] ✅ Sent to', phone);
+    await sock.sendMessage(formatPhone(phone), { text: message });
     return { status: 'sent' };
-  } catch (err) {
-    console.error('[WA] Send error:', err.message);
-    return { status: 'failed', error: err.message };
-  }
+  } catch (err) { return { status: 'failed', error: err.message }; }
 }
 
 function buildMessage(event, order) {
-  const n   = order.customer_name || 'Customer';
+  const n = order.customer_name || 'Customer';
   const num = `#${order.shopify_order_number}`;
   const amt = `PKR ${Number(order.total_price||0).toLocaleString()}`;
   const cn  = order.postex_cn || '';
   const msgs = {
-    confirmed: `Hello ${n}! 👋\n\n✅ *Order Confirmed*\n\nYour order *${num}* has been received.\n\n🛍 ${order.order_detail||'Your items'}\n💰 ${amt}\n💳 ${order.payment_method||'COD'}\n📍 ${order.shipping_city||''}\n\nThank you for shopping with us! 🙏`,
-    booked:    `Hello ${n}! 📦\n\nYour order *${num}* has been booked with PostEx.\n\n🔖 *Tracking:* ${cn}\n📍 ${order.shipping_city||''}\n\nTrack: https://postex.pk/tracking?cn=${cn}\n\nExpected: 2-4 working days 🚚`,
-    shipped:   `Hello ${n}! 🚚\n\nYour order *${num}* is *On the Way!*\n\n📦 PostEx: *${cn}*\nTrack: https://postex.pk/tracking?cn=${cn}\n\nKeep your phone available 📞`,
-    delivered: `Hello ${n}! 🎉\n\nYour order *${num}* has been *Delivered!*\n\nThank you for shopping with us! ⭐`,
+    confirmed: `Hello ${n}! 👋\n\n✅ *Order Confirmed*\n\nOrder *${num}* received.\n🛍 ${order.order_detail||'Your items'}\n💰 ${amt}\n💳 ${order.payment_method||'COD'}\n📍 ${order.shipping_city||''}\n\nThank you! 🙏`,
+    booked:    `Hello ${n}! 📦\n\nOrder *${num}* booked.\n\n🔖 Tracking: *${cn}*\nTrack: https://postex.pk/tracking?cn=${cn} 🚚`,
+    shipped:   `Hello ${n}! 🚚\n\nOrder *${num}* is on the way!\n📦 PostEx: *${cn}*`,
+    delivered: `Hello ${n}! 🎉\n\nOrder *${num}* delivered!\n\nThank you! ⭐`,
   };
   return msgs[event] || null;
 }
@@ -142,13 +98,10 @@ async function notifyCustomer(event, order) {
       });
     } catch(_) {}
     return result;
-  } catch (err) {
-    console.error('[WA] notifyCustomer error:', err.message);
-    return null;
-  }
+  } catch (err) { return null; }
 }
 
-// Start on load
-initClient().catch(e => console.error('[WA] Startup error:', e.message));
+// Init safely after server starts
+initClient();
 
 module.exports = { sendMessage, notifyCustomer, getStatus, initClient };
