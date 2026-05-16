@@ -27,13 +27,16 @@ async function initClient() {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH);
     console.log('[WA] Auth state loaded');
 
+    const { Browsers } = baileys;
     sock = makeWASocket({
       auth:   state,
       logger: pino({ level: 'silent' }),
-      browser: ['Ubuntu', 'Chrome', '20.0.04'],
+      browser: Browsers.ubuntu('Chrome'),
       syncFullHistory:              false,
       markOnlineOnConnect:          false,
       generateHighQualityLinkPreview: false,
+      connectTimeoutMs:             60000,
+      keepAliveIntervalMs:          25000,
     });
 
     sock.ev.on('connection.update', (update) => {
