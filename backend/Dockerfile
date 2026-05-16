@@ -1,6 +1,6 @@
 FROM node:20-alpine
 
-# Install git and build tools (required by baileys and native modules)
+# Install git and build tools (required by baileys)
 RUN apk add --no-cache git python3 make g++
 
 WORKDIR /app
