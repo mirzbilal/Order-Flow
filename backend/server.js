@@ -15,6 +15,8 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Safe route loader ────────────────────────────────────────
+const loadedRoutes  = [];
+const skippedRoutes = [];
 function safeRequire(path) {
   try { return require(path); }
   catch (e) { console.error(`[Route] Missing: ${path} — ${e.message}`); return null; }
@@ -34,14 +36,16 @@ const routes = [
 
 routes.forEach(([path, file]) => {
   const router = safeRequire(file);
-  if (router) app.use(path, router);
-  else console.warn(`[Server] Skipping missing route: ${file}`);
+  if (router) { app.use(path, router); loadedRoutes.push(file); }
+  else { console.warn(`[Server] Skipping missing route: ${file}`); skippedRoutes.push(file); }
 });
 
 // ─── Root ─────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   app: 'OrderFlow API', status: 'running', version: '1.0.0',
   time: new Date().toISOString(),
+  loadedRoutes: loadedRoutes,
+  skippedRoutes: skippedRoutes,
 }));
 
 // ─── Health ───────────────────────────────────────────────────
